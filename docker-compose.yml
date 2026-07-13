@@ -1,0 +1,34 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      # Mounted below at /app/data, not the whole /app — a named volume
+      # mounted over the entire app directory gets pre-populated from the
+      # image on first run and then permanently shadows the code with that
+      # stale snapshot on every rebuild.
+      - DATABASE_URL=sqlite:////app/data/market_monitor.db
+    volumes:
+      - backend_data:/app/data
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+      # Only needed if frontend/backend won't share a hostname+port (e.g.
+      # deploying each separately to the cloud) — for this same-host
+      # docker-compose setup the frontend already falls back to
+      # http://<hostname>:8000 automatically, so this can stay unset here.
+      # args:
+      #   VITE_API_BASE_URL: https://your-backend-url
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  backend_data:

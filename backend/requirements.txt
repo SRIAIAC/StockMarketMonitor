@@ -1,0 +1,17 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.51
+apscheduler==3.10.4
+yfinance==1.5.1
+feedparser==6.0.11
+vaderSentiment==3.3.2
+anthropic==0.34.2
+pydantic-settings==2.5.2
+httpx==0.28.1
+python-dotenv==1.0.1
+ddgs==9.14.4
+youtube-transcript-api==1.2.4
+beautifulsoup4==4.15.0
+lxml==6.1.1
+pytest==8.3.3
+pytest-mock==3.14.0

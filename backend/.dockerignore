@@ -1,0 +1,27 @@
+# Secrets — never send these to the Docker build context or bake them
+# into an image layer. Real secrets go in at deploy time (env vars /
+# Secret Manager), not the image.
+.env
+.env.*
+!.env.example
+
+# Local databases / dev artifacts — never ship real or scratch data in the
+# image; the container creates its own DB at startup (init_db()).
+*.db
+*.db-journal
+tmp_test_refresh.py
+
+# VCS / caches / tests — irrelevant to the runtime image, just bloats it
+# and (for .git) can carry the entire commit history including anything
+# ever committed and later "removed".
+.git
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store

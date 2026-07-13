@@ -1,0 +1,23 @@
+# Secrets — the frontend has no server-side secrets, but keep this in
+# place defensively; VITE_* values are meant to be public (they end up in
+# the built JS bundle, visible to anyone), real secrets never belong here.
+.env
+.env.*
+!.env.example
+
+# Local deps/build output — must be rebuilt inside the image (platform-
+# specific native deps in node_modules, and a stale local dist/ would
+# silently shadow a fresh build otherwise).
+node_modules/
+dist/
+
+# VCS / caches — irrelevant to the runtime image, just bloats it and (for
+# .git) can carry the entire commit history.
+.git
+.gitignore
+.pytest_cache/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store

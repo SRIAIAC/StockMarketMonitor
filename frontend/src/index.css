@@ -1,0 +1,160 @@
+/* Theme tokens — dark is the app's default/primary look (matches the
+ * product's reference design), explicitly toggled via the `data-theme`
+ * attribute (set pre-paint by the inline script in index.html, flipped at
+ * runtime by src/theme.ts) rather than only following the OS preference. */
+
+/* "Chrome" tokens for the sidebar/topbar shell — that chrome stays dark
+ * regardless of the app theme (a deliberate always-dark nav, same as most
+ * dashboard products), so it needs its OWN text/border tokens rather than
+ * the theme-flipping ones: --text-h's light-theme value is near-identical
+ * to the chrome background, which made topbar/sidebar text disappear in
+ * light mode when it borrowed the flipping tokens. Defined once, unaffected
+ * by [data-theme]. */
+:root {
+  --chrome-bg: #0d1317;
+  --chrome-surface: #12191e;
+  --chrome-surface-2: #1b242a;
+  --chrome-border: #253039;
+  --chrome-text: #eef5f8;
+  --chrome-muted: #8b98a3;
+  --chrome-accent: #2dd4bf;
+  --chrome-accent-bg: rgba(45, 212, 191, 0.14);
+  --chrome-accent-border: rgba(45, 212, 191, 0.4);
+}
+
+:root,
+:root[data-theme="dark"] {
+  --text: #a5b2bd;
+  --text-h: #eef5f8;
+  --muted: #7f8c96;
+  --bg: #0b1115;
+  --surface: #12191e;
+  --surface-alt: #171f25;
+  --surface-2: #1b242a;
+  --subtle: #0f151a;
+  --border: #253039;
+  --code-bg: #1d2a30;
+  --accent: #2dd4bf;
+  --accent-2: #38bdf8;
+  --accent-3: #818cf8;
+  --accent-bg: rgba(45, 212, 191, 0.12);
+  --accent-border: rgba(45, 212, 191, 0.4);
+  --social-bg: rgba(29, 42, 48, 0.65);
+  --shadow: rgba(0, 0, 0, 0.4) 0 16px 34px -20px;
+  --success: #34d399;
+  --danger: #f87171;
+  --sidebar-bg: #0d1317;
+
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --text: #4b5868;
+  --text-h: #0f172a;
+  --muted: #6b7a8a;
+  --bg: #eef7ff;
+  --surface: #ffffff;
+  --surface-alt: #f3f8ff;
+  --surface-2: #e9f2fb;
+  --subtle: #eef4fb;
+  --border: #dce8f4;
+  --code-bg: #e9f2fb;
+  --accent: #0f766e;
+  --accent-2: #0e7490;
+  --accent-3: #2563eb;
+  --accent-bg: rgba(15, 118, 110, 0.12);
+  --accent-border: rgba(15, 118, 110, 0.3);
+  --social-bg: rgba(226, 238, 255, 0.75);
+  --shadow: rgba(15, 46, 91, 0.08) 0 16px 34px -20px;
+  --success: #15803d;
+  --danger: #dc2626;
+  --sidebar-bg: #0f172a;
+
+  color-scheme: light;
+}
+
+:root[data-theme="light"] #social .button-icon {
+  filter: invert(1) brightness(2);
+}
+
+:root {
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 16px/145% var(--sans);
+  letter-spacing: 0;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+#root {
+  width: 100%;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--bg);
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: 44px;
+  letter-spacing: 0;
+  line-height: 1.05;
+  margin: 28px 0;
+  @media (max-width: 1024px) {
+    font-size: 34px;
+    margin: 20px 0;
+  }
+}
+h2 {
+  font-size: 22px;
+  line-height: 118%;
+  letter-spacing: 0;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+p {
+  margin: 0;
+}
+
+code,
+.counter {
+  font-family: var(--mono);
+  display: inline-flex;
+  border-radius: 4px;
+  color: var(--text-h);
+}
+
+code {
+  font-size: 15px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-journal
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+
+# Env — real secrets never committed; templates are fine
+.env
+.env.local
+!.env.example
+!.env.production
+
+# OS
+.DS_Store
+.vscode/
+.idea/
+
+# Scratch
+backend/tmp_test_refresh.py
