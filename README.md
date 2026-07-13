@@ -2,6 +2,10 @@
 
 A full-stack web application for tracking Indian NSE stocks in real time, with 10 background AI agents (live market, news, social, corporate actions, regulatory filings, economic calendar, sector rotation, risk, and confidence-scored recommendations), a dark-themed sidebar dashboard, investment alternatives, and financial calculators.
 
+For a system-level view (architecture diagrams, deployment topology, the
+AI fallback ladder, key design tradeoffs) see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+This file is the detailed step-by-step implementation walkthrough.
+
 ---
 
 ## Table of Contents
@@ -34,6 +38,7 @@ A full-stack web application for tracking Indian NSE stocks in real time, with 1
 8. [Setup & Running](#8-setup--running)
 9. [Environment Variables](#9-environment-variables)
 10. [Deploying to GCP](#10-deploying-to-gcp)
+11. [CI/CD](#11-cicd)
 
 ---
 
@@ -123,12 +128,14 @@ StockMarketMonitor/
 │   │   │   ├── risk_agent.py               # NEW — composite volatility/liquidity risk score
 │   │   │   ├── recommendation_agent.py     # NEW — Buy/Hold/Sell + confidence score
 │   │   │   ├── orchestrator_agent.py       # NEW — meta-agent: anomaly-triggered re-runs + LLM briefing
+│   │   │   ├── fii_dii_agent.py             # NEW — real whole-market FII/DII flow + news-derived per-stock mentions
 │   │   │   ├── alert_agent.py              # Rule-based + AI alerts
 │   │   │   └── README.md                   # Per-agent data source / design notes
 │   │   ├── analysis/
 │   │   │   ├── rules.py           # Deterministic alert thresholds
 │   │   │   ├── anomaly_rules.py   # NEW — cross-agent anomaly detection + agent-trigger mapping
-│   │   │   ├── claude_client.py   # Claude API wrapper (Haiku/Sonnet) — triage + recommend_reason() + generate_briefing()
+│   │   │   ├── claude_client.py   # Claude API wrapper — Claude → Ollama → rule-based 3-tier fallback (§7)
+│   │   │   ├── ollama_client.py   # NEW — local Ollama chat completion, tier 2 of the fallback ladder
 │   │   │   ├── sentiment.py       # VADER sentiment scoring
 │   │   │   └── youtube_analysis.py # Company/recommendation/topic/tone extraction
 │   │   └── api/
@@ -188,6 +195,7 @@ StockMarketMonitor/
 │   │       ├── CorporateActionsPanel.tsx      # NEW
 │   │       ├── RegulatoryAnnouncementsPanel.tsx # NEW
 │   │       ├── EconomicCalendarPanel.tsx      # NEW
+│   │       ├── FiiDiiPanel.tsx          # NEW — real flow chart + news-derived per-stock mentions + AI daily summary
 │   │       ├── TickerStrip.tsx          # NEW — bottom-pinned scrolling gainers/losers
 │   │       ├── AlertFeed.tsx    # parameterized: Market Alerts / Social Media Alerts
 │   │       ├── MoversPanel.tsx
@@ -257,6 +265,11 @@ app.include_router(ws.router)                # /ws/alerts
 | `RiskSnapshot` *(new)* | risk_score, risk_label, india_vix, watchlist_volatility, advances, declines, breadth_ratio, volume_spike_count, computed_at | RiskAgent |
 | `Recommendation` *(new)* | ticker, label, confidence, score, price, pct_change, sector, sentiment, reason, ai_reason, computed_at | RecommendationAgent (full-replace per run) |
 | `Alert` | ticker, category, severity, message, source_used_ai, created_at | AlertAgent |
+| `MarketBriefing` | headline, summary, anomalies (JSON), agents_triggered (JSON), ai_generated, computed_at | OrchestratorAgent (append-only) |
+| `FiiDiiFlow` *(new)* | trade_date (unique), fii_buy/sell/net_cr, dii_buy/sell/net_cr, fetched_at | FiiDiiAgent — real NSE data, one row/trading day |
+| `InstitutionalMention` *(new)* | ticker, category (FII/DII/FDI), title, url, sentiment, published_at | FiiDiiAgent — news-derived, not a confirmed transaction |
+| `FiiDiiSummary` *(new)* | trade_date (unique), summary, ai_generated, computed_at | FiiDiiAgent — one AI summary/trading day |
+| `YouTubeSentimentSummary` *(new)* | summary, ai_generated, computed_at | YouTubeAgent — one AI roll-up/3h run, not per video |
 
 A `YouTubeInsight` row with `ticker IS NULL` is a "processed, no company
 mentions found" marker — it stops the agent from re-fetching that video's
@@ -369,12 +382,25 @@ Summary:
 
 #### 4e — EconCalendarAgent (`econ_calendar_agent.py`)
 
-**What it does:** Tracks macro events — CPI, unemployment, fed funds rate, GDP — via FRED, each tagged with a static `importance` (high/medium) used by the Economic Calendar panel's colored-dot indicator.
+**What it does:** Scrapes Trading Economics' public India calendar page
+(`tradingeconomics.com/india/calendar`) for real India macro releases — CPI/
+WPI, GDP, IIP, PMI (mfg/services/composite), RBI rate decisions, trade
+balance, forex reserves, M3 money supply, and whatever else India releases
+the page is currently tracking (no static series allowlist). Each event is
+tagged with an `importance` (high/medium) used by the Economic Calendar
+panel's colored-dot indicator, plus an AI one-liner (`ai_reason`) on the top
+10 items explaining why the release matters.
 
-- No-ops entirely if `FRED_API_KEY` isn't configured (`/api/economic-events` then honestly returns empty rather than faking data)
-- Only stores a series if the release date isn't already recorded
+- **No API key required** — this was previously FRED-based (US-only data, a
+  structural mismatch for an India-first app) and was fully rewritten to
+  scrape real India data instead; no `FRED_API_KEY` setting exists anymore
+- Upserts by `(series_id, release_date)` — a row initially stored with only
+  a forecast gets `value`/`detail` updated in place once the real print
+  releases, rather than creating a duplicate row
+- Runs on a 3-hour interval (not 30 minutes) — it's a page scrape against a
+  third-party site, and macro releases don't happen more often than that
 
-**Tools used:** httpx, FRED API, SQLAlchemy
+**Tools used:** httpx, BeautifulSoup4, lxml, SQLAlchemy, claude_client.py
 
 ---
 
@@ -587,7 +613,11 @@ def recommend_reason(ticker, label, rule_reason) -> str | None:
 
 ### Step 6 — Scheduler (`scheduler.py`)
 
-**What it does:** Uses APScheduler to run 9 of the 10 agents on a 30-minute interval, YouTubeAgent on a 3-hour interval (these channels post far less often than prices/headlines move), plus two daily cron jobs timed to Indian market open and close.
+**What it does:** Uses APScheduler to run most agents on a 30-minute
+interval; YouTube/EconCalendar/FiiDii on a slower 3-hour interval (page
+scrapes / once-daily-changing data don't need to be polled every 30
+minutes); the Orchestrator on its own faster 15-minute interval; plus two
+daily cron jobs timed to Indian market open and close.
 
 ```python
 scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
@@ -596,7 +626,6 @@ scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
 scheduler.add_job(_market_agent.run_safe,          "interval", minutes=30, id="market_30m")
 scheduler.add_job(_news_agent.run_safe,             "interval", minutes=30, id="news_30m")
 scheduler.add_job(_social_agent.run_safe,           "interval", minutes=30, id="social_30m")
-scheduler.add_job(_econ_agent.run_safe,             "interval", minutes=30, id="econ_30m")
 scheduler.add_job(_corp_action_agent.run_safe,      "interval", minutes=30, id="corp_action_30m")
 scheduler.add_job(_regulatory_agent.run_safe,       "interval", minutes=30, id="regulatory_30m")
 scheduler.add_job(_risk_agent.run_safe,             "interval", minutes=30, id="risk_30m")
@@ -605,8 +634,11 @@ scheduler.add_job(_alert_agent.run_safe,            "interval", minutes=30, id="
 scheduler.add_job(_web_refresh,                     "interval", minutes=30, id="web_30m")
 scheduler.add_job(_analytics_refresh,               "interval", minutes=30, id="analytics_30m")
 
-# Every 3 hours — YouTube channels post far less often
+# Every 3 hours — YouTube channels post far less often; EconCalendar is a
+# page scrape (be a good citizen); FII/DII flow only changes once/trading-day
 scheduler.add_job(_youtube_agent.run_safe,  "interval", minutes=180, id="youtube_180m")
+scheduler.add_job(_econ_agent.run_safe,     "interval", minutes=180, id="econ_180m")
+scheduler.add_job(_fii_dii_agent.run_safe,  "interval", minutes=180, id="fii_dii_180m")
 
 # Every 15 minutes — faster than the other agents, so it can react to
 # anomalies between full sweeps
@@ -621,6 +653,15 @@ scheduler.add_job(..., "cron", hour=15, minute=45, timezone="Asia/Kolkata")
 Recommendation both read other agents' freshly-written rows (prices,
 sentiment, sector data), so they run after Market/News/Social/EconCalendar
 and just before Recommendation, which also reads the Risk snapshot.
+
+> **Note (found live, not by inspection alone):** `/api/agents/status`'s
+> staleness check (`routes_agents.py`) originally used one flat
+> `stale_after_minutes=90` for every agent — correct for the 30-minute
+> agents, but it wrongly marked `econ_calendar` `not_active` for the second
+> half of every 3-hour cycle. `econ_calendar` now gets a 200-minute
+> staleness window (`stale_after = 200 if key == "econ_calendar" else 90`)
+> to match its real cadence. See `EXPERIMENTS.md` (2026-07-13) for how this
+> was found.
 
 **Tools used:** APScheduler, pytz / zoneinfo
 
@@ -662,6 +703,7 @@ and just before Recommendation, which also reads the Risk snapshot.
 | `GET /api/risk-score` | Latest composite risk snapshot | RiskSnapshot table |
 | `GET /api/economic-events` | Macro releases with importance tag | EconomicEvent table |
 | `GET /api/briefing` | `{headline, summary, anomalies[], agents_triggered[], ai_generated, computed_at, orchestrator_active, orchestrator_last_run}` | MarketBriefing table (OrchestratorAgent) |
+| `GET /api/fii-dii` | Real whole-market daily FII/DII net flow (₹ Cr, ~90 days accumulated) + news-derived per-stock FII/FDI/DII mentions (90-day window) + an AI daily summary | FiiDiiFlow + InstitutionalMention + FiiDiiSummary tables (FiiDiiAgent) |
 
 #### `routes_alerts.py`
 
@@ -866,7 +908,7 @@ markup:
 | `EconomicCalendarPage.tsx` | `/economic-calendar` | Expanded `EconomicCalendarPanel` |
 | `SectorRotationPage.tsx` | `/sector-rotation` | Full (non-compact) `SectorPerformance` |
 | `RiskMonitorPage.tsx` | `/risk-monitor` | `RiskMonitor` |
-| `RecommendationsPage.tsx` | `/recommendations` | `AIRecommendationCard` (expanded) + `BuySellPanel` (web-scraped, market-wide signals) |
+| `RecommendationsPage.tsx` | `/recommendations` | `AIRecommendationCard` (expanded) + `FiiDiiPanel` (real flow + news-derived mentions) + `BuySellPanel` (web-scraped, market-wide signals) |
 | `WatchlistPage.tsx` | `/watchlist` | `ShareWiseCharts` + the full watchlist table |
 | `AlertsPage.tsx` | `/alerts` | Both `AlertFeed` panels |
 | `AgentsStatusPage.tsx` | `/agents` | `AgentStatusRow` + a per-agent run-detail table (linked from the sidebar's "View Details" button) |
@@ -888,11 +930,36 @@ Deposit Rates · IPO Tracker.
 
 ### Step 15 — Calculators Page (`Calculators.tsx`)
 
-Unchanged this round. Two fully client-side calculators (Asset Allocation,
-Share Portfolio Drill) — see inline code comments for the CAGR/allocation
-formulas.
+Two fully client-side calculators — no backend calls, all computation runs
+in the browser.
 
-**Tools used:** React 19 (useState), TypeScript, chart.js, CSS `conic-gradient`
+**Asset Allocation Calculator:** Rule-of-100 equity/debt/gold/cash split
+(age, horizon, risk profile, goal), editable percentages that proportionally
+rebalance the rest, and a projected SIP corpus via a blended-CAGR future
+value formula.
+
+**Share Portfolio Drill:** builds a multi-stock portfolio and simulates it
+forward via correlated Geometric Brownian Motion (a single common factor
+`z = √ρ·f + √(1-ρ)·ε` blends each stock's idiosyncratic draw with a shared
+market shock, `ρ` = the correlation slider). Each holding carries **Alpha
+and Beta** alongside price/expected-return/volatility — Beta is a per-stock
+input (defaults from a static catalog), Alpha is derived live via CAPM
+(`α = μ − (rf + β×(market − rf))`), shown per-row and as portfolio-level
+weighted metrics next to Sharpe/volatility.
+
+Because a single simulated GBM path is inherently a different random draw
+every time it's run (the literal complaint that prompted this rework — see
+`EXPERIMENTS.md`), the panel now runs an **always-live 150-path Monte Carlo
+ensemble** (`runMonteCarlo()`) alongside the animated single-path drill,
+reporting mean/median/5th–95th-percentile range/chance-of-loss — by the law
+of large numbers this stays statistically stable between clicks even though
+any one path doesn't. The animated drill result is explicitly relabeled
+"This Run's Result — one simulated path" rather than presented as *the*
+answer. Accessibility: every table input has a distinguishing `aria-label`
+(previously only the column header conveyed meaning), form labels use
+`htmlFor`/`id` pairing, and the day counter is `aria-live="polite"`.
+
+**Tools used:** React 19 (useState/useMemo), TypeScript, chart.js, CSS `conic-gradient`
 
 ---
 
@@ -912,6 +979,7 @@ formulas.
 | `CorporateActionsPanel.tsx` | Date-stamped list: company, action-type chip, value | `api.corporateActions()` |
 | `RegulatoryAnnouncementsPanel.tsx` | Date-stamped list: company, category chip, subject, filing link | `api.regulatoryAnnouncements()` |
 | `EconomicCalendarPanel.tsx` | Date-stamped list with importance-colored dot | `api.economicEvents()` |
+| `FiiDiiPanel.tsx` | AI daily summary + real FII/DII flow bar chart + news-derived per-stock mention list (sentiment-dotted) | `api.fiiDii()` |
 | `TickerStrip.tsx` | Bottom-pinned auto-scrolling gainers/losers ticker | CSS keyframe animation, `api.marketMovers()` |
 | `AlertFeed.tsx` | Alert cards, severity-colored; parameterized by category | WebSocket via `connectAlertsSocket()` + `api.alerts()` |
 | `MoversPanel.tsx` | Top 5 gainers & losers table, polls every 5 min | `api.marketMovers()`, colour-coded % change |
@@ -1035,34 +1103,69 @@ top of libraries already in the project.
 
 ## 7. LLMs Used — Where and Why
 
-Five places in the app are *wired* to call Claude — Market Alerts, Social
-Media Alerts (both via `AlertAgent`/`claude_client.py`), the top-5
-`RecommendationAgent` picks' one-line AI reasons, the `OrchestratorAgent`
-market briefing, and the ChatBot. All five gate the Claude call behind
-`if not settings.anthropic_api_key: return <rule-based fallback>` — **no
-`ANTHROPIC_API_KEY` is configured by default**, so out of the box every one
-of these runs its non-AI fallback path instead. Company/recommendation/
-topic/tone extraction for the YouTube panel, the Risk/Recommendation
-composite scores, and — critically — **which agents OrchestratorAgent
-re-triggers** are all rule-based/deterministic by design (no LLM call, and
-no LLM *decision*, involved at all).
+Every AI-touched field in the app — alert explanations, recommendation
+reasons, the Orchestrator briefing, corporate-action/regulatory/econ-calendar
+one-liners, the YouTube sentiment summary, the FII/DII daily summary, and
+the ChatBot — goes through the same **three-tier fallback ladder**, not
+just a single Claude call:
 
-### `claude-haiku-4-5-20251001` — Fast Triage, Recommendation Reasons & Briefings
+```
+1. Claude (Haiku, escalating to Sonnet for high-impact/anomaly cases)
+       │  skipped entirely if ANTHROPIC_API_KEY is unset
+       ▼
+2. Local Ollama (via ollama_client.py, http://localhost:11434)
+       │  tried whenever Claude is unset or its call fails;
+       │  skipped if `ollama serve` isn't reachable or the model isn't pulled
+       ▼
+3. Deterministic rule-based / templated text
+       (never raises, never a blank panel)
+```
+
+`claude_client.py`'s five functions (`triage_and_explain`,
+`recommend_reason`, `generate_briefing`, `explain_relevance`,
+`summarize_context`) all share one `_ollama_fallback()` helper for tier 2,
+and `routes_chat.py` implements the same ladder directly for the ChatBot.
+**No `ANTHROPIC_API_KEY` is configured by default** in this repo, so out of
+the box every one of these runs on tier 2 (if a local Ollama server is
+running) or tier 3. Company/recommendation/topic/tone extraction for the
+YouTube panel, the Risk/Recommendation composite scores, and — critically —
+**which agents OrchestratorAgent re-triggers** are all rule-based/
+deterministic by design (no LLM call, and no LLM *decision*, involved at
+all, regardless of tier).
+
+### Tier 1 — `claude-haiku-4-5-20251001` — Fast Triage, Reasons & Briefings
 
 **Used for:** every alert signal `rules.py` flags `needs_ai=True`, the
 one-line reason on each of the top-5 displayed `RecommendationAgent` picks,
-and the routine (no-anomaly) `OrchestratorAgent` market briefing.
+the routine (no-anomaly) `OrchestratorAgent` market briefing, the
+corporate-action/regulatory/econ-calendar one-liners (bounded to the top 10
+items per panel), and the YouTube/FII-DII narrative summaries.
 
 **Why Haiku:** sub-second response time, very low cost per call.
 
 ---
 
-### `claude-sonnet-4-6` — Deep Market Analysis, Anomaly Briefings & Chat
+### Tier 1 (escalated) — `claude-sonnet-4-6` — Deep Analysis & Chat
 
 **Used for:** only the alert subset Haiku itself flags `HIGH_IMPACT: yes`,
 the `OrchestratorAgent` briefing *only* on cycles where a rule-based
-anomaly actually fired (richer analysis when there's more to explain),
-and every ChatBot conversation turn.
+anomaly actually fired (richer analysis when there's more to explain), and
+every ChatBot conversation turn.
+
+---
+
+### Tier 2 — Local Ollama (`ollama_client.py`, model: `llama3.2` by default)
+
+**Used for:** the exact same call sites as tier 1, as a free fallback when
+no Anthropic key is configured (or a Claude call fails) — requires
+`ollama serve` running locally with `OLLAMA_MODEL` pulled
+(`OLLAMA_BASE_URL`/`OLLAMA_MODEL` in `.env`, see §9). Two Ollama-specific
+tuning notes baked into `ollama_client.py`: `num_ctx` is explicitly raised
+to 8192 (Ollama's 2048 default silently truncates most of the DB-grounded
+system prompt otherwise), and temperature is kept near-zero to stay
+extractive rather than creative when reading back real numbers. Genuinely
+answers with real DB-grounded numbers, not fabricated ones — verified live,
+see `EXPERIMENTS.md`.
 
 ---
 
@@ -1070,9 +1173,12 @@ and every ChatBot conversation turn.
 
 `claude_client.py` caches by a SHA-256 hash of the prompt for the life of
 the process — a re-fired identical signal or recommendation reason returns
-the cached explanation instead of paying for it twice. The Recommendation
-Agent bounds spend further by only requesting an AI reason for the top-5
-picks actually displayed, never the full 15-stock watchlist.
+the cached explanation instead of paying for it twice (tier 1 only; Ollama
+calls are free so aren't cached). The Recommendation Agent bounds spend
+further by only requesting an AI reason for the top-5 picks actually
+displayed, never the full watchlist. Corporate-action/regulatory/
+econ-calendar one-liners are bounded to the top 10 items shown per panel
+and persist once written, so a run only pays for genuinely new entries.
 
 ---
 
@@ -1082,8 +1188,7 @@ picks actually displayed, never the full 15-stock watchlist.
 
 - Python 3.11+
 - Node.js 20+
-- An Anthropic API key is **optional** — see [§7](#7-llms-used--where-and-why). Everything else (prices, news, social, sectors, corporate actions, regulatory announcements, risk, recommendations, YouTube sentiment, analytics) needs no key at all.
-- A FRED API key is optional — the Economic Calendar panel is honestly empty without one, rather than fabricated.
+- An Anthropic API key is **optional** — see [§7](#7-llms-used--where-and-why). Without one, a local Ollama server (also optional) or a rule-based fallback runs instead. Everything else (prices, news, social, sectors, corporate actions, regulatory announcements, economic calendar, risk, recommendations, FII/DII flow, YouTube sentiment, analytics) needs no key at all.
 
 ### Backend
 
@@ -1128,17 +1233,20 @@ Create `backend/.env` from `.env.example`:
 # Watchlist — NSE tickers in Yahoo Finance format (.NS suffix)
 WATCHLIST=RELIANCE.NS,HDFCBANK.NS,TCS.NS,ICICIBANK.NS,BHARTIARTL.NS,CGPOWER.NS,DIXON.NS,COFORGE.NS,PERSISTENT.NS,MPHASIS.NS,CDSL.NS,IEX.NS,CYIENT.NS,GLENMARK.NS,BIRLACORPN.NS
 
-# AI — Claude (optional; unlocks AI-generated alert explanations,
-# recommendation reasons, and ChatBot answers. Without it, alerts/
-# recommendations use their rule-generated message and the ChatBot falls
-# back to a rule-based reply + optional DuckDuckGo search)
+# AI — tier 1 of the 3-tier fallback ladder (§7). Optional; unlocks
+# Claude-generated alert explanations, recommendation reasons, briefings,
+# and ChatBot answers. Without it, tier 2 (Ollama, below) or tier 3
+# (rule-based / templated text) runs instead — never a blank panel.
 ANTHROPIC_API_KEY=sk-ant-...
+
+# AI — tier 2, the free no-API-key fallback. Requires `ollama serve`
+# running locally with OLLAMA_MODEL pulled (`ollama pull llama3.2`). If
+# unreachable, every AI touchpoint falls through to tier 3 automatically.
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2
 
 # News — optional; falls back to Google News RSS if missing
 NEWSAPI_KEY=...
-
-# Economic calendar — optional; econ agent skips itself if unset
-FRED_API_KEY=...
 
 # Database — SQLite file path
 DATABASE_URL=sqlite:///./market_monitor.db
@@ -1150,9 +1258,9 @@ ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 ```
 
 No env var is needed for CorporateActionAgent, RegulatoryAnnouncementAgent,
-RiskAgent, RecommendationAgent, or the YouTube Analyst Sentiment feature —
-all use free, keyless NSE/YouTube endpoints or the app's own accumulated
-data.
+RiskAgent, RecommendationAgent, EconCalendarAgent, FiiDiiAgent, or the
+YouTube Analyst Sentiment feature — all use free, keyless NSE/YouTube/
+Trading-Economics endpoints or the app's own accumulated data.
 
 ---
 
@@ -1245,6 +1353,72 @@ git pull
 docker compose up --build -d
 ```
 
+Or, once CI/CD is set up (below), just `git push` — no SSH needed.
+
 ---
 
-*Built with FastAPI · React 19 · Claude AI (Haiku + Sonnet) · NSE India · goodreturns.in · mfapi.in · youtube-transcript-api*
+## 11. CI/CD
+
+`.github/workflows/deploy.yml` runs on every push/PR to `main`:
+
+```
+push/PR → main
+   ├─► backend-tests   (pytest, backend/requirements.txt)
+   └─► frontend-build  (npm ci && npm run build — tsc + vite)
+            │
+            ▼  (only on push to main, only if both jobs above passed)
+         deploy
+            └─► SSH into the GCE VM (appleboy/ssh-action) and run:
+                git fetch origin main
+                git reset --hard origin/main
+                sudo docker compose up --build -d
+```
+
+Opening a PR runs the tests/build without deploying; merging (or pushing
+directly) to `main` deploys automatically.
+
+### One-time setup
+
+1. **Put the VM's code under git**, not a one-off `scp` — clone the repo
+   into the same path `docker-compose.yml` expects, keeping `backend/.env`
+   in place (it's gitignored, so a later `git reset --hard` never touches
+   it):
+   ```bash
+   mv StockMarketMonitor StockMarketMonitor.bak   # keep the old copy just in case
+   git clone <your-repo-url> StockMarketMonitor
+   cp StockMarketMonitor.bak/backend/.env StockMarketMonitor/backend/.env
+   cd StockMarketMonitor && sudo docker compose up --build -d
+   ```
+
+2. **Generate a dedicated deploy keypair** (not your personal SSH key) and
+   append the public half to the VM's `authorized_keys`:
+   ```bash
+   ssh-keygen -t ed25519 -f deploy_key -N "" -C "github-actions-deploy"
+   # then on the VM:
+   #   mkdir -p ~/.ssh && echo "<contents of deploy_key.pub>" >> ~/.ssh/authorized_keys
+   ```
+
+3. **Add three repo secrets** (Settings → Secrets and variables → Actions):
+
+   | Secret | Value |
+   |--------|-------|
+   | `DEPLOY_HOST` | the VM's static external IP |
+   | `DEPLOY_USER` | the SSH username on the VM |
+   | `DEPLOY_SSH_KEY` | contents of the **private** half of the deploy keypair |
+
+4. Push `.github/workflows/deploy.yml` to `main`. If this is the *first*
+   push containing a workflow file, a plain `repo`-scoped `gh`/git token
+   will be rejected — GitHub requires the `workflow` OAuth scope to create
+   or update files under `.github/workflows/`:
+   ```bash
+   gh auth refresh -h github.com -s workflow
+   gh auth setup-git
+   ```
+
+**Rotating the deploy key:** generate a new pair, append the new public key
+to the VM's `authorized_keys` (don't remove the old one until the new one
+is confirmed working), then `gh secret set DEPLOY_SSH_KEY < newkey`.
+
+---
+
+*Built with FastAPI · React 19 · Claude AI (Haiku + Sonnet) + local Ollama fallback · NSE India · goodreturns.in · mfapi.in · youtube-transcript-api*
