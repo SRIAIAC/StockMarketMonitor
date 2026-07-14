@@ -7,6 +7,29 @@ Backend test suite baseline: `cd backend && python -m pytest tests/ -q` → 22 p
 
 ---
 
+## 2026-07-14 (2)
+
+### Watchlist doubled 50 → 100 tickers
+- **Ask:** "for the watchlist panel fill with 100 shares instaed of 50."
+- **Picked 50 new NSE tickers** (40 large-cap/30 mid-cap/30 small-cap total, up from 20/15/15), spanning sectors not yet represented (IT services, NBFC/financial services, metals, PSU banks, diagnostics, cables, specialty chemicals) alongside deepening existing ones. **Verified every single new ticker resolves via a live yfinance lookup before adding any of them** — not assumed — given this project's prior real incident with a silently-delisted ticker (`TATAMOTORS.NS`, see 2026-07-11). All 50 resolved with real live prices, zero failures, zero overlap with the existing 50.
+- **Updated in lockstep** (a stale copy of any one of these would have silently shadowed the others): `config.py`'s default, `.env.example`, `.env.production`, and — the one that actually controls local runtime — `backend/.env` itself, which had its own hardcoded `WATCHLIST=` override that would have made the `config.py` change a no-op locally until found and fixed. Also updated `frontend/src/marketBuckets.ts`'s cap-bucket lists (used by the Watchlist page's grouping) to match.
+- **Verified live, not just "no errors thrown":** rebuilt the local Docker deployment, confirmed `/api/watchlist` returns exactly 100 tickers, force-recreated the backend container to pick up the corrected `.env`, triggered a full refresh, and queried the DB directly — 1885 accumulated `Price` rows, **zero missing a real price**, 100 `Recommendation` rows (was 50). Caught what looked like a real bug along the way: `/api/briefing` initially still read "12 stocks advancing... out of the 50 tracked" after the refresh — traced it by directly querying `MarketBriefing` rows with timestamps, and it turned out to be a benign timing artifact (checked a couple of seconds before the freshest orchestrator write landed, not a stale-count bug) — the very next row correctly read "32 advancing and 68 declining out of 100 tracked." Worth being suspicious of "looks right" here specifically because `orchestrator_agent.py` computes `total` dynamically from `len(priced)`, not a hardcoded constant — confirmed by reading the actual source before concluding it was just timing.
+- **Tested:** `pytest -q` → 22 passed, `npx tsc --noEmit` clean. Full live verification against the rebuilt local Docker deployment as described above; pushed and confirmed the GitHub Actions CI/CD pipeline (tests → build → SSH deploy) went green and the live GCP site stayed healthy afterward.
+
+---
+
+## 2026-07-14 (1)
+
+### db.py: fixed real "database is locked" crashes; docker-compose: fixed a real Ollama Docker-networking bug
+- **Ask (first):** "run the program and update the dashboard" surfaced several agents silently failing.
+- **`db.py`:** found live (not assumed) that `news`/`social`/`regulatory_announcement`/`risk`/`recommendation`/`orchestrator` were all crashing mid-run with `sqlite3.OperationalError: database is locked` whenever a manual `/api/refresh` raced a regularly-scheduled interval job — SQLite's default `busy_timeout` is 0, so any writer-vs-writer collision fails immediately instead of waiting. Enabled WAL journal mode + a 30s busy timeout on every connection. Verified under the exact conditions that broke it: fired 3 concurrent full agent sweeps against the rebuilt container — zero lock errors, every agent came back active (previously this failed on a single overlapping refresh).
+- **Ask (second):** "Ollama linked parameters single line summaries are not working effectively as reasons are same for multiple companies."
+- **Root cause, verified not assumed:** `OLLAMA_BASE_URL=http://localhost:11434` in `backend/.env` is correct for running the backend directly on the host, but inside the Docker container "localhost" is the container itself — every Ollama call from the containerized backend was silently failing (connection refused), so every corporate-action/regulatory/econ one-liner fell through to the same static per-category rule-based text. This is exactly why, e.g., every "Dividend" action across different companies showed byte-identical wording — they were never AI-generated at all. Fixed in `docker-compose.yml`: override `OLLAMA_BASE_URL` to `host.docker.internal` (Docker's DNS name for the host machine), plus `extra_hosts: host-gateway` so it resolves on Linux Docker Engine too (the GCP VM), where it's a no-op since nothing listens on 11434 there anyway — not a regression. Verified live: two different companies' dividend announcements now produce genuinely distinct, company-specific reasoning instead of boilerplate ("A dividend payout of Rs 23 per share from IMPAL may be attractive to investors seeking regular income..." vs. "This dividend announcement may impact the value of ABREL shares..."). Cleared the 41 DB rows already stuck with fallback-only text (data, not code) so they'd regenerate with real reasons on the next run.
+- **Also traced (same investigation):** the local `econ_calendar` agent showing `not_active` turned out to be a real stale-schedule gap (~10.5h since last run despite a 3h cadence, most likely a laptop-sleep-related APScheduler misfire that silently drops missed occurrences rather than catching up) — not a bug, resolved by a manual refresh; and the local Docker deployment itself was found to be running a **6-day-old image**, predating several agents entirely — rebuilt with current code.
+- **Tested:** `pytest -q` → 22 passed both times. Live verification via direct DB queries and container log inspection throughout, not just HTTP status codes.
+
+---
+
 ## 2026-07-13 (7)
 
 ### CI/CD: GitHub Actions runs tests + auto-deploys to the GCE VM on push to main

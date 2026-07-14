@@ -4,20 +4,30 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # 50 NSE tickers spanning large/mid/small cap across banking, IT, FMCG,
+    # 100 NSE tickers spanning large/mid/small cap across banking, IT, FMCG,
     # auto, pharma, energy, cement, metals, chemicals, consumer, and more —
     # see agents/README.md for the cap/sector breakdown. TMPV = Tata Motors
     # Passenger Vehicles (incl. JLR) — TATAMOTORS.NS was delisted under that
-    # symbol after the Oct 2025 commercial/passenger-vehicle demerger.
+    # symbol after the Oct 2025 commercial/passenger-vehicle demerger. Every
+    # ticker below (including the 50 added to double the original watchlist)
+    # was verified live via yfinance before being added — see EXPERIMENTS.md.
     watchlist: str = (
         "RELIANCE.NS,HDFCBANK.NS,TCS.NS,ICICIBANK.NS,BHARTIARTL.NS,INFY.NS,HINDUNILVR.NS,"
         "ITC.NS,LT.NS,SBIN.NS,AXISBANK.NS,KOTAKBANK.NS,MARUTI.NS,SUNPHARMA.NS,TMPV.NS,"
         "TATASTEEL.NS,NTPC.NS,POWERGRID.NS,ULTRACEMCO.NS,ASIANPAINT.NS,"
+        "WIPRO.NS,HCLTECH.NS,BAJFINANCE.NS,BAJAJFINSV.NS,TITAN.NS,NESTLEIND.NS,ADANIENT.NS,"
+        "ADANIPORTS.NS,JSWSTEEL.NS,HINDALCO.NS,ONGC.NS,COALINDIA.NS,BPCL.NS,GRASIM.NS,"
+        "DRREDDY.NS,CIPLA.NS,HEROMOTOCO.NS,EICHERMOT.NS,INDUSINDBK.NS,M&M.NS,"
         "CGPOWER.NS,DIXON.NS,COFORGE.NS,PERSISTENT.NS,MPHASIS.NS,CDSL.NS,IEX.NS,CYIENT.NS,"
         "GLENMARK.NS,BIRLACORPN.NS,FEDERALBNK.NS,AUBANK.NS,PIIND.NS,DEEPAKNTR.NS,SRF.NS,"
+        "GODREJCP.NS,DABUR.NS,MARICO.NS,BERGEPAINT.NS,HAVELLS.NS,AMBUJACEM.NS,TORNTPHARM.NS,"
+        "LUPIN.NS,ESCORTS.NS,BANKBARODA.NS,PNB.NS,IDFCFIRSTB.NS,ZYDUSLIFE.NS,ALKEM.NS,JUBLFOOD.NS,"
         "TRENT.NS,PAGEIND.NS,VOLTAS.NS,INDHOTEL.NS,LTTS.NS,"
         "CAMS.NS,KPITTECH.NS,RAINBOW.NS,CLEAN.NS,ANGELONE.NS,ROUTE.NS,LATENTVIEW.NS,"
-        "HAPPSTMNDS.NS,GRANULES.NS,RATNAMANI.NS"
+        "HAPPSTMNDS.NS,GRANULES.NS,RATNAMANI.NS,"
+        "POLYCAB.NS,KEI.NS,BLUESTARCO.NS,APLAPOLLO.NS,JBCHEPHARM.NS,NAVINFLUOR.NS,FINEORG.NS,"
+        "GALAXYSURF.NS,CENTURYPLY.NS,VGUARD.NS,RADICO.NS,METROPOLIS.NS,LALPATHLAB.NS,"
+        "CROMPTON.NS,IRCTC.NS"
     )
 
     anthropic_api_key: str = ""
