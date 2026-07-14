@@ -26,6 +26,7 @@ from sqlalchemy import func
 
 from app.agents.base import BaseAgent
 from app.analysis import claude_client
+from app.analysis.sector_map import canonical_sector
 from app.config import settings
 from app.models import NewsItem, Price, Recommendation, RiskSnapshot, SocialPost
 
@@ -111,9 +112,16 @@ class RecommendationAgent(BaseAgent):
                 scores_list = sentiment_by_ticker.get(p.ticker, [])
                 sentiment = sum(scores_list) / len(scores_list) if scores_list else 0.0
                 vol_ratio = (p.volume / p.avg_volume) if p.avg_volume else 1.0
+                # `p.sector` is Moneycontrol's/yfinance's own label (whichever
+                # source served this ticker — see market_agent.py) and almost
+                # never matches sector_momentum's 14 NSE-index-derived names
+                # verbatim ("Financial Services" vs "Banking", etc) — look up
+                # by the normalized name instead so this term isn't silently
+                # neutral for most of the watchlist. See sector_map.py.
+                sector = canonical_sector(p.ticker, p.sector)
                 # Sector momentum_score is 0-100 (50=neutral) — recenter to
                 # -1..+1 to match the other terms' scale before weighting.
-                sector_term = ((sector_momentum.get(p.sector, 50.0)) - 50.0) / 50.0
+                sector_term = ((sector_momentum.get(sector, 50.0)) - 50.0) / 50.0
 
                 raw_score = (
                     (p.pct_change / 5.0) * 0.5
@@ -139,11 +147,11 @@ class RecommendationAgent(BaseAgent):
                     reasons.append("negative sentiment")
                 if p.avg_volume and p.volume > p.avg_volume * 1.5:
                     reasons.append(f"{p.volume / p.avg_volume:.1f}x avg volume")
-                if p.sector and p.sector in sector_momentum:
+                if sector and sector in sector_momentum:
                     if sector_term > 0.1:
-                        reasons.append(f"{p.sector} sector rotating in")
+                        reasons.append(f"{sector} sector rotating in")
                     elif sector_term < -0.1:
-                        reasons.append(f"{p.sector} sector rotating out")
+                        reasons.append(f"{sector} sector rotating out")
                 reason = ", ".join(reasons) or "Neutral"
 
                 scored.append({

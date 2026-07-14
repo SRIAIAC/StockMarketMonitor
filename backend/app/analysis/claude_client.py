@@ -111,8 +111,9 @@ def recommend_reason(ticker: str, label: str, rule_reason: str) -> str | None:
         "You are a market analyst assistant. Given a rule-based "
         "stock recommendation and the signal behind it, write one "
         "concise, plain-English sentence (no disclaimers, no "
-        "repeating the ticker name) explaining the reasoning.\n\n"
-        + prompt
+        "repeating the ticker name) explaining the reasoning. Repeat "
+        "any number from the signal exactly as given — do not "
+        "convert or recalculate it.\n\n" + prompt
     )
 
     client = _client()
@@ -162,7 +163,9 @@ def generate_briefing(context: str, has_anomalies: bool) -> tuple[str, str] | No
         "several independent monitoring agents. Write a short "
         "headline (under 12 words) on the first line, then on the "
         "following lines a 3-5 sentence plain-English briefing. No "
-        "disclaimers, no markdown formatting.\n\n" + context
+        "disclaimers, no markdown formatting. Repeat any number from "
+        "the data exactly as given — do not convert units or "
+        "recalculate anything.\n\n" + context
     )
 
     client = _client()
@@ -214,7 +217,9 @@ def explain_relevance(kind: str, description: str) -> str | None:
     instruction = (
         "In one short, plain-English sentence (under 25 words, no "
         "disclaimers), explain why this might matter to an Indian "
-        f"equity investor.\n\n{prompt}"
+        "equity investor. If you repeat any figure from the text "
+        "below, use the exact same number and unit — do not convert "
+        f"or recalculate it.\n\n{prompt}"
     )
 
     client = _client()
@@ -255,7 +260,11 @@ def summarize_context(topic: str, context: str, max_tokens: int = 150) -> str | 
     instruction = (
         f"Summarize the following {topic} in 2-4 plain-English "
         "sentences for an Indian equity investor. No disclaimers, "
-        f"no markdown formatting.\n\n{context}"
+        "no markdown formatting. Any monetary figures in the source "
+        "(e.g. amounts in ₹ Cr) must be repeated using the exact "
+        "same number and unit given — do not convert to lakhs, "
+        "millions, billions, or any other unit; small local models "
+        "reliably get this arithmetic wrong.\n\n" + context
     )
 
     client = _client()
