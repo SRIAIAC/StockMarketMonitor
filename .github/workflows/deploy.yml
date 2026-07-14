@@ -46,5 +46,10 @@ jobs:
             cd ~/StockMarketMonitor
             git fetch origin main
             git reset --hard origin/main
-            sudo docker compose up --build -d
+            # --force-recreate: `docker compose up -d` alone does not
+            # reliably pick up backend/.env content changes (it's gitignored,
+            # so git reset never touches it, but a manual edit on the VM
+            # can drift from what's running) -- found live when a watchlist
+            # env-only change silently kept serving the old container.
+            sudo docker compose up --build -d --force-recreate
             sudo docker image prune -f
