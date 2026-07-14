@@ -31,6 +31,7 @@ class SocialAgent(BaseAgent):
         # The session doesn't autoflush, so a DB dedup check alone can't see
         # rows added earlier in this same run — track them here too.
         seen_urls: set[str] = set()
+        failures = 0
         try:
             for ticker in settings.tickers:
                 symbol = _stocktwits_symbol(ticker)
@@ -39,8 +40,9 @@ class SocialAgent(BaseAgent):
                     req = urllib.request.Request(url, headers=HEADERS)
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         payload = json.loads(resp.read())
-                except Exception:
-                    logger.warning("StockTwits lookup failed for %s", ticker)
+                except Exception as exc:
+                    failures += 1
+                    logger.debug("StockTwits lookup failed for %s: %s", ticker, exc)
                     continue
 
                 for msg in payload.get("messages", []):
@@ -67,6 +69,18 @@ class SocialAgent(BaseAgent):
                             fetched_at=dt.datetime.utcnow(),
                         )
                     )
+            # A handful of per-ticker misses is normal flakiness; every single
+            # ticker failing in the same run means StockTwits/Cloudflare is
+            # broadly blocking us (seen in practice: 503 from residential IPs,
+            # 403 from datacenter IPs like GCP) — worth one loud signal instead
+            # of N buried per-ticker warnings nobody will scroll through.
+            if settings.tickers and failures == len(settings.tickers):
+                logger.warning(
+                    "StockTwits appears to be blocking all %d requests this run "
+                    "(Cloudflare 403/503) — no new social posts collected. This "
+                    "is an upstream block, not expected to self-resolve by retrying.",
+                    failures,
+                )
             session.commit()
         finally:
             session.close()
