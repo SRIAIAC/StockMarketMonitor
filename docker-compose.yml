@@ -12,6 +12,21 @@ services:
       # image on first run and then permanently shadows the code with that
       # stale snapshot on every rebuild.
       - DATABASE_URL=sqlite:////app/data/market_monitor.db
+      # `.env`'s OLLAMA_BASE_URL=http://localhost:11434 is correct for
+      # running the backend directly on the host, but inside this container
+      # "localhost" means the container itself, not the machine running
+      # `ollama serve` — every Ollama call silently failed (connection
+      # refused) and every AI one-liner fell through to the same generic
+      # per-category rule-based text, which is why e.g. every Dividend
+      # action across different companies showed identical wording. Override
+      # to the host machine via Docker's special DNS name (works out of the
+      # box on Docker Desktop; extra_hosts below makes it resolve on Linux
+      # Docker Engine too, e.g. the GCP VM — where nothing is listening on
+      # 11434 anyway, so it just correctly falls through to tier 3, same as
+      # before, no regression there).
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - backend_data:/app/data
 
