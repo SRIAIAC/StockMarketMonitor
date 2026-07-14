@@ -1,16 +1,37 @@
 import logging
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+_is_sqlite = "sqlite" in settings.database_url
+
 engine = create_engine(
     settings.database_url,
-    connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
+    connect_args={"check_same_thread": False} if _is_sqlite else {},
 )
+
+if _is_sqlite:
+    # APScheduler's BackgroundScheduler runs jobs in a thread pool, so two
+    # agents can genuinely be mid-write at the same moment (e.g. a manual
+    # /api/refresh sweep overlapping a regularly-scheduled interval job) —
+    # SQLite allows only one writer at a time and, with the default
+    # busy_timeout of 0, the second writer fails immediately with
+    # "database is locked" instead of just waiting its turn. WAL mode lets
+    # readers stop blocking writers (and vice versa), and a real
+    # busy_timeout makes a genuine writer-vs-writer collision retry for a
+    # few seconds instead of raising outright — same fix either process
+    # (agents writing, or a request reading concurrently) needed.
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
