@@ -81,7 +81,7 @@ This file is the detailed step-by-step implementation walkthrough.
 │  Moneycontrol · yfinance · Google News RSS · StockTwits    │
 │  NSE India (allIndices, sector indices, corporate actions, │
 │  corporate announcements, chart-databyindex, movers) ·     │
-│  goodreturns.in · mfapi.in · FRED · YouTube RSS + captions  │
+│  goodreturns.in · mfapi.in · Trading Economics · YouTube RSS + captions │
 ├───────────────────────────────────────────────────────────┤
 │              AI Layer (Anthropic Claude)                  │
 │  Haiku — fast triage + recommendation reasons              │
@@ -114,7 +114,7 @@ StockMarketMonitor/
 │   │   ├── main.py              # FastAPI app entry point
 │   │   ├── config.py            # Environment settings (Pydantic)
 │   │   ├── models.py            # SQLAlchemy database models (10 tables)
-│   │   ├── db.py                # DB engine, session, init + column migration
+│   │   ├── db.py                # DB engine, session, init + column migration + WAL/busy_timeout
 │   │   ├── scheduler.py         # APScheduler job definitions (10 agents)
 │   │   ├── agents/
 │   │   │   ├── base.py                     # BaseAgent, run_safe(), in-process liveness tracking
@@ -278,6 +278,14 @@ transcript on every cycle, and is filtered out of `/api/youtube-insights`.
 `RegulatoryAnnouncement` is deliberately **not** modeled as "SEBI filings"
 internally — see [Agent Roster](#agent-roster-10-agents) below for why.
 
+**Concurrency (`db.py`):** the engine enables SQLite's WAL journal mode and
+a 30-second `busy_timeout` on every connection. Found live: APScheduler's
+`BackgroundScheduler` runs jobs in a thread pool, so two agents can
+genuinely be mid-write at the same moment — with SQLite's default
+`busy_timeout` of 0, a writer-vs-writer collision used to fail instantly
+with `sqlite3.OperationalError: database is locked` instead of just
+waiting its turn.
+
 **Tools used:** SQLAlchemy, SQLite
 
 ---
@@ -288,12 +296,13 @@ internally — see [Agent Roster](#agent-roster-10-agents) below for why.
 
 ```python
 class Settings(BaseSettings):
-    watchlist: list[str]        # 15 NSE tickers (e.g. RELIANCE.NS)
-    anthropic_api_key: str      # Claude API
-    newsapi_key: str            # NewsAPI.org
-    fred_api_key: str           # Economic data
-    database_url: str           # SQLite path
-    allowed_origins: str        # CORS allowlist — includes 5173-5175/5190 dev-port fallbacks
+    watchlist: str               # 100 NSE tickers, comma-separated (e.g. RELIANCE.NS,...)
+    anthropic_api_key: str       # Claude API — tier 1 of the AI fallback ladder (§7)
+    ollama_base_url: str         # tier 2 — local Ollama, e.g. http://localhost:11434
+    ollama_model: str            # tier 2 — e.g. llama3.2
+    newsapi_key: str             # NewsAPI.org (optional; Google News RSS used by default)
+    database_url: str            # SQLite path
+    allowed_origins: str         # CORS allowlist — includes 5173-5175/5190 dev-port fallbacks
     price_poll_minutes: int = 15
 ```
 
@@ -307,7 +316,15 @@ All agents inherit from `BaseAgent` (`agents/base.py`), which provides a
 `run_safe()` wrapper that catches and logs exceptions without crashing the
 scheduler, and tracks each agent's last-run time and success/failure
 in-process — this is what powers the real (not hardcoded) `/api/agents/status`
-liveness check.
+liveness check. `run_safe()` also holds a per-agent-name lock (a plain
+`threading.Lock`, non-blocking): a second concurrent trigger for the same
+agent — e.g. a manual `/api/refresh` firing while that agent's own
+scheduled interval is also mid-run — skips cleanly instead of racing to
+insert the same row twice, found live via a real `sqlite3.IntegrityError`
+crash before this existed. `agent_last_ok(name)` exposes whether an
+agent's *last* run genuinely raised (as opposed to just being between its
+own longer-cadence runs) — this is what `OrchestratorAgent`'s self-healing
+step (§4j) uses to decide which agents are actually worth retrying.
 
 See the full per-agent table (data source, table written, notable design
 decisions) in [`backend/app/agents/README.md`](backend/app/agents/README.md).
@@ -487,18 +504,35 @@ confidence = 50 + min(abs(score), 1.0) * 49  # never claims false 100% certainty
   this panel, unlike `RiskSnapshot`)
 - `/api/recommendations` is now a pure DB read of this agent's latest run,
   not a live per-request computation
+- **`sector_momentum_term`, found live to be silently neutral for 84% of
+  the watchlist:** `sector_momentum` is keyed by the 14 NSE-sectoral-index
+  names `/api/sectors` derives ("Banking", "IT", "Metal", ...), but a
+  ticker's stored `Price.sector` is Moneycontrol's or yfinance's own label
+  depending on which source served it (see MarketAgent above) — e.g.
+  "Bank - Private", "Financial Services", "Basic Materials" — which almost
+  never matches verbatim. Only 16/100 tickers matched by exact string,
+  including original-watchlist tickers like `AXISBANK.NS`, so this
+  predates the watchlist's 50→100 expansion. `analysis/sector_map.py`
+  normalizes `Price.sector` to a real canonical bucket for 88/100 tickers
+  before the lookup (a raw-string map for unambiguous cases, a per-ticker
+  override for yfinance's broad buckets like "Basic Materials" that span
+  Metal/Cement/Chemicals depending on the company); the remaining 12
+  (telecom, retail, hotels, ports, construction) are honestly left
+  unmapped since none of the 14 indices cover them
 
-**Tools used:** SQLAlchemy, claude_client.py
+**Tools used:** SQLAlchemy, claude_client.py, analysis/sector_map.py
 
 ---
 
 #### 4j — OrchestratorAgent (`orchestrator_agent.py`) — *new, meta-agent*
 
-**What it does:** Reads every other agent's latest output and does two
+**What it does:** Reads every other agent's latest output and does three
 things — decides (rule-based) whether specific agents should re-run
-off-cycle, and asks Claude to narrate the current cross-agent state into a
-short market briefing. Not one of the 10 agent-roster cards — it's an
-orchestrator *over* those 10, not an 11th data source.
+off-cycle, **self-heals any agent whose last run actually failed**, and
+asks Claude to narrate the current cross-agent state into a short market
+briefing. Not one of the 10 agent-roster cards — it's an orchestrator
+*over* those 10 (plus a supervisor over all 11 real agents, including
+itself excluded), not an 11th data source.
 
 ```python
 anomalies = [
@@ -511,6 +545,14 @@ anomalies = [
 triggered = merge_triggered_agents(anomalies)   # union + dedupe
 for name in triggered:
     AGENT_CLASSES[name]().run_safe()             # only these — never a full run_all_agents() sweep
+
+# Self-heal: retry any agent whose *last* run genuinely failed — distinct
+# from the anomaly re-runs above, and distinct from an agent that's simply
+# between its own longer-cadence runs (agent_last_ok() is False only for an
+# explicit caught exception, never for "hasn't run in a while").
+for name, agent_cls in ALL_SUPERVISED_AGENTS.items():
+    if name not in triggered and agent_last_ok(name) is False:
+        agent_cls().run_safe()
 
 headline, summary = claude_client.generate_briefing(context, has_anomalies=bool(anomalies))
 ```
@@ -532,7 +574,18 @@ deterministic, and testable.
 - No API key configured → falls back to a deterministic templated
   headline/summary built from the same structured facts, never a blank panel
 - Writes one `MarketBriefing` row per run (append-only); `GET /api/briefing`
-  reads the latest
+  reads the latest. Self-healed agents are folded into the same
+  `agents_triggered` field as anomaly re-runs, tagged `(self-healed)` to
+  distinguish the two
+- **Self-healing, found live:** `run_safe()` (`agents/base.py`) holds a
+  per-agent-name lock, so a manual `/api/refresh` racing that agent's own
+  scheduled interval used to let two runs fetch the same item concurrently
+  and crash on a `UNIQUE constraint` violation when both tried to insert it
+  — the second run would silently show `active: false` until its next
+  scheduled cycle. The lock makes a second concurrent trigger skip cleanly
+  instead of racing; the orchestrator's self-heal step is the safety net
+  for whatever still manages to fail (a genuine external API outage, a real
+  bug) rather than leaving it stuck until the next 30-minute interval
 
 **Tools used:** SQLAlchemy, claude_client.py, anomaly_rules.py
 
@@ -772,7 +825,8 @@ alert's own stored `message` (not a freshly re-fetched live price).
 | 9 | RecommendationAgent | AI Recommendations | New — Buy/Hold/Sell + confidence, replaces the old inline composite |
 | 10 | AlertAgent | Alerts | Implemented since v1 |
 | — | YouTubeAgent | *(feeds the Social Sentiment page)* | Implemented since v1 |
-| — | **OrchestratorAgent** | *(the Market Briefing panel, top of Overview)* | New — meta-agent over the 10 above, not an 11th roster card; see §4j |
+| — | FiiDiiAgent | *(the FII/FDI/DII panel, AI Recommendations page)* | New — real whole-market flow + news-derived per-stock mentions, same "not one of the 10" reasoning as YouTubeAgent |
+| — | **OrchestratorAgent** | *(the Market Briefing panel, top of Overview)* | New — meta-agent over the 10 above (plus a self-healing supervisor over all 11 real agents, itself excluded); see §4j |
 
 The product spec's 10 agents map exactly to the 10 cards on the Overview
 page's agent-status row (Market/News/Social/CorporateAction/Regulatory/
@@ -1004,11 +1058,10 @@ Every 30 min (APScheduler)
      ├─► MarketAgent ──────────► Moneycontrol / yfinance ────► Price table
      ├─► NewsAgent ────────────► Google News RSS (Indian+Intl) ► NewsItem table
      ├─► SocialAgent ──────────► StockTwits API ──────────────► SocialPost table
-     ├─► EconCalendarAgent ────► FRED ────────────────────────► EconomicEvent table
      ├─► CorporateActionAgent ─► NSE corporate-actions ────────► CorporateAction table
      ├─► RegulatoryAnnouncementAgent ► NSE corporate-announcements ► RegulatoryAnnouncement table
      ├─► RiskAgent ─────────────► NSE allIndices + own Price history ► RiskSnapshot table
-     ├─► RecommendationAgent ───► Price + sentiment + sector + risk ► Recommendation table
+     ├─► RecommendationAgent ───► Price + sentiment + sector(normalized, see §4i) + risk ► Recommendation table
      │        (reads the above 4 tables + latest RiskSnapshot)
      └─► AlertAgent (reads last 60 min of Price/NewsItem/SocialPost)
               │
@@ -1020,7 +1073,9 @@ Every 30 min (APScheduler)
                                           └─► Alert table + WebSocket broadcast
 
 Every 3 h (APScheduler)
-     └─► YouTubeAgent ──► 6 channels' RSS + captions ──► rule-based extraction ──► YouTubeInsight table
+     ├─► YouTubeAgent ──► 6 channels' RSS + captions ──► rule-based extraction ──► YouTubeInsight table
+     ├─► EconCalendarAgent ─► Trading Economics scrape ──────────► EconomicEvent table
+     └─► FiiDiiAgent ───────► NSE fiidiiTradeReact + news mentions ► FiiDiiFlow/InstitutionalMention tables
 
 Every 15 min (independent of the 30-min agent cadence) + tail of every full sweep
      └─► OrchestratorAgent (reads Price/sentiment/RiskSnapshot/sectors/Alert/Recommendation)
@@ -1029,6 +1084,9 @@ Every 15 min (independent of the 30-min agent cadence) + tail of every full swee
               │        (rule-based, never the LLM) which agents, if any, to
               │        re-trigger off-cycle right now
               │        └─► e.g. a >5% price move ──► News.run_safe() + Social.run_safe() + Alert.run_safe()
+              ├─► self-heal — any agent whose *last* run genuinely raised
+              │        (not just "hasn't run in a while") gets retried too,
+              │        via the same run_safe() + per-agent lock (§4/base.py)
               └─► claude_client.generate_briefing() — Haiku, or Sonnet if an
                        anomaly fired — narrates the (already-decided) facts
                        into a headline + summary
@@ -1097,7 +1155,7 @@ top of libraries already in the project.
 | **YouTube RSS + captions** | 6 Indian finance channels' new videos + transcripts | httpx (feed) + youtube-transcript-api |
 | **goodreturns.in** | Gold rates (IBJA daily retail rates) | httpx + BeautifulSoup |
 | **mfapi.in** | Mutual fund NAV history | httpx JSON |
-| **FRED API** | Macro / economic calendar events | httpx REST (no-ops if `FRED_API_KEY` unset) |
+| **Trading Economics** | India macro / economic calendar events | httpx + BeautifulSoup (no API key — replaced an earlier FRED-based version that only covered US series) |
 
 ---
 
@@ -1180,6 +1238,17 @@ displayed, never the full watchlist. Corporate-action/regulatory/
 econ-calendar one-liners are bounded to the top 10 items shown per panel
 and persist once written, so a run only pays for genuinely new entries.
 
+### Correctness Guardrail — Numbers Are Never the AI's to Compute
+
+Every instruction sent to tier 1/2 explicitly tells the model to repeat
+any figure from the source data exactly as given — never convert units or
+recalculate. Found live in the FII/DII daily summary: a small local Ollama
+model turned a real `-3062.27 Cr` figure into "₹3.06 billion" (off by 10x —
+3062 Crore is actually ≈30.6 billion). Same principle as the rest of this
+codebase's AI usage (§ design note in 4j): the model narrates facts that
+were already decided/computed elsewhere, it doesn't get to do arithmetic
+of its own.
+
 ---
 
 ## 8. Setup & Running
@@ -1222,6 +1291,17 @@ docker-compose up --build
 # Backend: http://localhost:8000
 # Frontend: http://localhost:5173
 ```
+
+If you run a local Ollama server for tier 2 of the AI fallback ladder
+(§7), note that `docker-compose.yml` overrides `OLLAMA_BASE_URL` to
+`http://host.docker.internal:11434` for the containerized backend —
+`.env`'s own `http://localhost:11434` is correct for running the backend
+directly on the host, but inside the container "localhost" means the
+container itself, not the machine actually running `ollama serve`. Found
+live: every Ollama call was silently failing (connection refused) and
+every AI one-liner fell through to the same generic per-category
+rule-based text — which is exactly why different companies' "Dividend"
+actions were showing identical wording.
 
 ---
 
@@ -1319,7 +1399,7 @@ sudo apt-get install -y docker-compose-plugin
 ```bash
 git clone <your-repo-url> && cd StockMarketMonitor
 cp backend/.env.production backend/.env
-# Edit backend/.env: fill in ANTHROPIC_API_KEY / NEWSAPI_KEY / FRED_API_KEY
+# Edit backend/.env: fill in ANTHROPIC_API_KEY / NEWSAPI_KEY
 # (all optional — see §9), and set ALLOWED_ORIGINS to the VM's static IP:
 #   ALLOWED_ORIGINS=http://<external-ip>:5173
 ```

@@ -161,7 +161,8 @@ degraded one.
 
 `OrchestratorAgent` is a meta-agent, not a 12th data source — it reads
 every other agent's latest output, decides (rule-based) whether anything
-warrants an off-cycle re-run, and asks the AI ladder to narrate the result.
+warrants an off-cycle re-run, self-heals any agent that's actually broken,
+and asks the AI ladder to narrate the result.
 
 ```
 every 15 min ──► gather snapshot (Price, sentiment, RiskSnapshot ×2,
@@ -174,17 +175,31 @@ every 15 min ──► gather snapshot (Price, sentiment, RiskSnapshot ×2,
                         │
              ┌──────────┴──────────┐
              ▼                     ▼
-     triggered agents        claude_client.generate_briefing()
-     .run_safe() only —      (Haiku, or Sonnet if an anomaly fired)
-     never a full sweep              │
-                                      ▼
-                          MarketBriefing row (append-only)
+     triggered agents        self-heal: any agent whose *last*
+     .run_safe() only —      run genuinely failed also gets
+     never a full sweep      retried (agent_last_ok() == False —
+             │               not just "hasn't run in a while")
+             ▼                     │
+     claude_client.generate_briefing() ◄──┘
+     (Haiku, or Sonnet if an anomaly fired)
+                  │
+                  ▼
+       MarketBriefing row (append-only)
 ```
 
 This is the same "rules decide, AI narrates" split as `AlertAgent`, applied
 one level up — the Orchestrator's value is in deciding *what's worth
 re-checking right now*, which is exactly the kind of decision that should
 be fast, free, and deterministic rather than delegated to a model call.
+
+**Self-healing, found live:** two overlapping runs of the same agent (a
+manual `/api/refresh` racing that agent's own scheduled interval) used to
+both fetch the same item and crash the second one on a SQLite `UNIQUE`
+constraint — silently leaving that agent `inactive` until its next
+scheduled cycle. `agents/base.py`'s `run_safe()` now holds a per-agent
+lock so a second concurrent trigger skips cleanly instead of racing;
+the orchestrator's self-heal step is the safety net for whatever still
+manages to fail for a real reason (an external API outage, a genuine bug).
 
 ---
 
@@ -283,7 +298,7 @@ from an empty DB.
 | Layer | Choice | Why |
 |---|---|---|
 | Backend framework | FastAPI + Uvicorn | Async-capable, typed, WebSocket support built in |
-| ORM / DB | SQLAlchemy + SQLite | Zero-ops persistence; one file, one Docker volume — no managed DB service to run for a single-instance app |
+| ORM / DB | SQLAlchemy + SQLite (WAL mode, per-agent write locks) | Zero-ops persistence; one file, one Docker volume — no managed DB service to run for a single-instance app. WAL + a 30s busy_timeout + an in-process per-agent lock (§2/§5) handle the concurrent-writer pattern this scheduler creates, found live rather than anticipated upfront |
 | Scheduling | APScheduler (in-process `BackgroundScheduler`) | No external queue/broker needed; ties agent liveness directly to the running process (§7 tradeoff) |
 | Frontend framework | React 19 + TypeScript + Vite | Fast HMR dev loop, static typing across every API boundary |
 | Charts | chart.js | Used for both the Market Overview index chart and the Calculators' Monte Carlo simulation chart — one charting dependency, not two |
