@@ -33,7 +33,7 @@ import logging
 
 from sqlalchemy import func
 
-from app.agents.base import BaseAgent
+from app.agents.base import BaseAgent, agent_last_ok
 from app.analysis import claude_client
 from app.analysis.anomaly_rules import (
     Anomaly,
@@ -77,6 +77,32 @@ def _agent_classes() -> dict[str, type[BaseAgent]]:
         "alert": AlertAgent,
         "risk": RiskAgent,
         "recommendation": RecommendationAgent,
+    }
+
+
+# Every real scheduled agent the orchestrator supervises for self-healing
+# (§ below) — deliberately wider than `_agent_classes()` above, which is
+# only the subset anomaly_rules.py ever names as an anomaly's trigger
+# target. orchestrator/sector_rotation are excluded: orchestrator is this
+# agent itself (no self-retry), and sector_rotation isn't a real scheduled
+# agent at all — it's computed inline per-request in routes_market.py, so
+# it has no run_safe() to retry and no failure state to self-heal.
+def _all_supervised_agent_classes() -> dict[str, type[BaseAgent]]:
+    from app.agents.corporate_action_agent import CorporateActionAgent
+    from app.agents.econ_calendar_agent import EconCalendarAgent
+    from app.agents.fii_dii_agent import FiiDiiAgent
+    from app.agents.market_agent import MarketAgent
+    from app.agents.regulatory_announcement_agent import RegulatoryAnnouncementAgent
+    from app.agents.youtube_agent import YouTubeAgent
+
+    return {
+        **_agent_classes(),
+        "market": MarketAgent,
+        "corporate_action": CorporateActionAgent,
+        "regulatory_announcement": RegulatoryAnnouncementAgent,
+        "econ_calendar": EconCalendarAgent,
+        "youtube": YouTubeAgent,
+        "fii_dii": FiiDiiAgent,
     }
 
 
@@ -202,6 +228,27 @@ class OrchestratorAgent(BaseAgent):
                 logger.info("Orchestrator: anomaly detected, re-triggering %s", name)
                 agent_cls().run_safe()
 
+            # ── Self-heal: retry any agent whose *last* run actually failed ──
+            # Distinct from the anomaly-triggered re-runs above (those react
+            # to market conditions; this reacts to the monitoring pipeline's
+            # own health). agent_last_ok() returns False only for an explicit
+            # failure (an exception run_safe() caught) — never for an agent
+            # that's merely between its own longer-cadence runs (YouTube/
+            # FiiDii/EconCalendar on 3h intervals correctly stay untouched
+            # here most of the time). Skips anything already retried above
+            # this cycle, and run_safe()'s own per-agent lock (agents/base.py)
+            # makes a retry racing a not-yet-finished original run a safe
+            # no-op rather than the exact overlapping-write conflict this is
+            # meant to recover from.
+            healed: list[str] = []
+            for name, agent_cls in _all_supervised_agent_classes().items():
+                if name in triggered:
+                    continue
+                if agent_last_ok(name) is False:
+                    logger.info("Orchestrator: self-heal — %s failed last run, retrying", name)
+                    agent_cls().run_safe()
+                    healed.append(name)
+
             # ── Briefing context (facts only — Claude narrates, doesn't decide) ──
             context_lines = [
                 f"Watchlist breadth: {advances} advancing, {declines} declining, out of {len(priced)} tracked.",
@@ -236,6 +283,10 @@ class OrchestratorAgent(BaseAgent):
                 context_lines.append("Anomalies detected this cycle: " + "; ".join(a.description for a in anomalies) + ".")
             else:
                 context_lines.append("No anomalies detected this cycle — conditions are within normal range.")
+            if healed:
+                context_lines.append(
+                    "Self-healed: " + ", ".join(healed) + " failed their previous run and were retried."
+                )
 
             context_text = "\n".join(context_lines)
 
@@ -254,7 +305,7 @@ class OrchestratorAgent(BaseAgent):
                     headline=headline,
                     summary=summary,
                     anomalies="; ".join(a.description for a in anomalies),
-                    agents_triggered=", ".join(triggered),
+                    agents_triggered=", ".join([*triggered, *(f"{h} (self-healed)" for h in healed)]),
                     ai_generated=1 if ai_generated else 0,
                     computed_at=dt.datetime.utcnow(),
                 )
