@@ -3,7 +3,17 @@
 Running log of changes made to StockMarketMonitor and how each one was verified.
 Newest entries at the top. Format per entry: **what changed**, **why**, **how it was tested**.
 
-Backend test suite baseline: `cd backend && python -m pytest tests/ -q` → 22 passed.
+Backend test suite baseline: `cd backend && python -m pytest tests/ -q` → 26 passed.
+
+---
+
+## 2026-07-16
+
+### New: a watchdog that self-corrects when APScheduler's own background thread goes silent
+- **Ask:** "start the program" surfaced that no scheduled agent had run in ~22 hours despite the container being up 25 — the web server stayed perfectly responsive the whole time (a separate thread), only the scheduler had gone quiet. User then asked for "an agent which looks after all other agents... make them continuously fetch data" as a permanent fix rather than needing a manual `/api/refresh` each time.
+- **Why the existing self-healing (2026-07-15) couldn't catch this:** `OrchestratorAgent`'s self-heal step retries agents whose *last run* explicitly failed — but it's itself an APScheduler job. If the scheduler's own background thread has stalled, the orchestrator's job never fires either, so nothing inside the job system can notice or fix it. Confirmed live via container logs: `AlertAgent` had genuinely succeeded on 2026-07-15 at 07:32, then a misfire warning ("was missed by 0:12:26"), then total silence from every agent until a manual refresh 22 hours later — not a crash, an APScheduler internal stall (plausible cause: the host machine was suspended, which pauses the Docker Desktop/WSL2 VM this container runs in, and APScheduler's timer didn't recover cleanly on wake).
+- **Fix:** a genuinely independent mechanism — `scheduler.py`'s new `start_watchdog()` spawns a plain `threading.Thread` with its own `time.sleep()` loop, deliberately *not* an APScheduler job, so it keeps checking regardless of whatever state APScheduler's internal thread is in. Every 10 minutes it checks the most recent `last_run_for()` (new accessor in `agents/base.py`) across the 8 agents on the 30-minute cadence ("canaries" — used only to judge whether the scheduler is ticking *at all*, not any single agent's own health); if the freshest of those is over 60 minutes old (2x the shortest real cadence, so one normal missed cycle doesn't false-positive), it logs a warning and calls the existing `trigger_immediate_refresh()`. Also added a coarse `_sweep_lock` around `trigger_immediate_refresh()` itself so a watchdog-triggered sweep can't pile up a redundant duplicate on top of an already-running one (the per-agent locks from 2026-07-15 already make that data-safe, but there's no reason to spawn an extra thread that would just skip everything anyway).
+- **Tested:** extracted the per-check logic into `_watchdog_check()` (called by the sleep loop) specifically so it's testable without waiting on real wall-clock time. New `tests/test_scheduler.py`, 4 cases verified directly against `agents.base._last_run`: fresh timestamps → no trigger; all 8 canaries stale (61 min) → triggers; one canary still recent among seven stale ones → no trigger (proves the scheduler is alive even if not every agent has come around yet); no data at all (fresh process startup, before the first sweep completes) → no trigger, avoiding a false positive on every cold start. `pytest -q` → 26 passed (was 22). Rebuilt the local Docker deployment, confirmed the startup log line ("Watchdog started — checks every 10 min...") actually appears, and ran a full manual sweep afterward to confirm no regression — 9/10 real agents active, zero new `IntegrityError`/lock errors.
 
 ---
 

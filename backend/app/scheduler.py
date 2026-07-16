@@ -1,5 +1,7 @@
+import datetime as dt
 import logging
 import threading
+import time
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -7,6 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 from app.config import settings
 from app.api.web_data import _do_refresh as _web_refresh
 from app.api.analytics_data import _do_refresh as _analytics_refresh
+from app.agents.base import last_run_for
 from app.agents.market_agent import MarketAgent
 from app.agents.news_agent import NewsAgent
 from app.agents.social_agent import SocialAgent
@@ -71,9 +74,28 @@ def run_all_agents() -> None:
     logger.info("All agents finished")
 
 
+_sweep_lock = threading.Lock()
+
+
 def trigger_immediate_refresh() -> None:
-    """Spawn a background thread to refresh all data without blocking the caller."""
-    t = threading.Thread(target=run_all_agents, daemon=True, name="immediate-refresh")
+    """Spawn a background thread to refresh all data without blocking the
+    caller. Non-blocking lock: if a full sweep is already running (another
+    manual refresh, the watchdog below, or a daily cron sweep), a new
+    trigger is skipped rather than piling up a redundant duplicate — the
+    per-agent locks in agents/base.py already make that safe, but there's
+    no reason to spawn a whole extra thread that will just skip everything
+    anyway."""
+    if not _sweep_lock.acquire(blocking=False):
+        logger.info("A full agent sweep is already in progress — skipping duplicate trigger")
+        return
+
+    def _run() -> None:
+        try:
+            run_all_agents()
+        finally:
+            _sweep_lock.release()
+
+    t = threading.Thread(target=_run, daemon=True, name="immediate-refresh")
     t.start()
 
 
@@ -127,4 +149,64 @@ def start_scheduler() -> None:
     logger.info(
         "Scheduler started — most data refreshes every 30 min "
         "(YouTube and econ calendar every 3h) + daily at 09:15 and 15:45 IST"
+    )
+
+
+# ── Watchdog ─────────────────────────────────────────────────────────────
+# Found live: after the host machine was suspended (laptop sleep, which
+# pauses the Docker Desktop / WSL2 VM this container runs in) and resumed,
+# APScheduler's own background thread went silent for ~22 hours — no agent
+# fired on its interval at all — while the FastAPI web server stayed
+# perfectly responsive the whole time (it's a separate thread). A fix that
+# lived *inside* a scheduled job (e.g. extending OrchestratorAgent's
+# self-heal step further) can't catch this: if the scheduler itself has
+# stalled, that job never fires either. This watchdog is deliberately a
+# plain daemon thread with its own sleep loop, not an APScheduler job, so
+# it keeps checking regardless of whatever state APScheduler's internal
+# thread is in.
+_WATCHDOG_CHECK_SECONDS = 600  # every 10 minutes
+_WATCHDOG_STALE_AFTER_MINUTES = 60  # 2x the shortest (30-min) agent cadence
+
+# 30-minute-cadence agents only, used purely as canaries to judge "is the
+# scheduler ticking at all" — not "is this specific agent healthy" (that's
+# OrchestratorAgent's job, and it assumes the scheduler itself is running).
+_CANARY_AGENTS = [
+    "market", "news", "social", "corporate_action",
+    "regulatory_announcement", "risk", "recommendation", "alert",
+]
+
+
+def _watchdog_check() -> None:
+    """One staleness check — split out from `_watchdog_loop()`'s sleep loop
+    so it's independently callable/testable without waiting on real time."""
+    timestamps = [t for t in (last_run_for(name) for name in _CANARY_AGENTS) if t is not None]
+    if not timestamps:
+        return  # still starting up — nothing to judge yet
+    stale_for = dt.datetime.utcnow() - max(timestamps)
+    if stale_for >= dt.timedelta(minutes=_WATCHDOG_STALE_AFTER_MINUTES):
+        logger.warning(
+            "Watchdog: no 30-min-cadence agent has run in %s — the scheduler "
+            "likely stalled (e.g. the host was suspended and didn't recover "
+            "cleanly on wake). Triggering a catch-up sweep.",
+            stale_for,
+        )
+        trigger_immediate_refresh()
+
+
+def _watchdog_loop() -> None:
+    while True:
+        time.sleep(_WATCHDOG_CHECK_SECONDS)
+        try:
+            _watchdog_check()
+        except Exception:
+            logger.exception("Watchdog check failed")
+
+
+def start_watchdog() -> None:
+    t = threading.Thread(target=_watchdog_loop, daemon=True, name="scheduler-watchdog")
+    t.start()
+    logger.info(
+        "Watchdog started — checks every %d min, self-triggers a catch-up sweep "
+        "if no 30-min-cadence agent has run in over %d min",
+        _WATCHDOG_CHECK_SECONDS // 60, _WATCHDOG_STALE_AFTER_MINUTES,
     )

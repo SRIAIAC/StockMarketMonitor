@@ -278,6 +278,18 @@ true pay-per-request. (The Dockerfiles still respect an injected `$PORT`
 env var for Cloud-Run compatibility if that tradeoff is ever revisited —
 see `Dockerfile` comments in both `backend/` and `frontend/`.)
 
+Even a persistent process isn't a complete guarantee, found live: on a
+local dev machine, suspending the host (which pauses the Docker Desktop/
+WSL2 VM underneath) left APScheduler's own background thread silently not
+firing for ~22 hours after the host woke back up — the web server thread
+was unaffected and kept answering requests normally the whole time.
+`scheduler.py`'s `start_watchdog()` is the defense-in-depth answer: a
+plain `threading.Thread` with its own sleep loop, independent of
+APScheduler entirely, that self-triggers a catch-up sweep if nothing's run
+recently. Less likely to matter on the always-on GCP VM (nothing suspends
+it), but it's a cheap safety net there too against any other silent-stall
+cause, not just laptop sleep specifically.
+
 **Why `git reset --hard` on deploy is safe:** `backend/.env` is gitignored
 and lives only on the VM's filesystem, never in a commit — a hard reset
 touches only tracked files, so secrets and the running config survive every

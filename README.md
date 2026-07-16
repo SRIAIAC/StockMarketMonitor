@@ -673,7 +673,7 @@ minutes); the Orchestrator on its own faster 15-minute interval; plus two
 daily cron jobs timed to Indian market open and close.
 
 ```python
-scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+scheduler = BackgroundScheduler()
 
 # Every 30 minutes
 scheduler.add_job(_market_agent.run_safe,          "interval", minutes=30, id="market_30m")
@@ -706,6 +706,21 @@ scheduler.add_job(..., "cron", hour=15, minute=45, timezone="Asia/Kolkata")
 Recommendation both read other agents' freshly-written rows (prices,
 sentiment, sector data), so they run after Market/News/Social/EconCalendar
 and just before Recommendation, which also reads the Risk snapshot.
+
+**Watchdog (`start_watchdog()`), found necessary live:** APScheduler's own
+background thread can silently stop firing jobs entirely — found on a
+local dev machine after the host was suspended (laptop sleep, which pauses
+the Docker Desktop/WSL2 VM the container runs in): the web server stayed
+perfectly responsive the whole time, but no agent ran on its interval for
+~22 hours until a manual `/api/refresh`. A fix living *inside* a scheduled
+job (like OrchestratorAgent's self-heal step, §4j) can't catch this — if
+the scheduler itself has stalled, that job never fires either. The
+watchdog is deliberately a **plain daemon thread with its own
+`time.sleep()` loop, not an APScheduler job** — every 10 minutes it checks
+whether any 30-minute-cadence agent (`last_run_for()`, `agents/base.py`)
+has run in the last 60 minutes; if not, it calls `trigger_immediate_refresh()`
+itself. Runs regardless of whatever state APScheduler's internal thread is
+in, since it doesn't depend on it at all.
 
 > **Note (found live, not by inspection alone):** `/api/agents/status`'s
 > staleness check (`routes_agents.py`) originally used one flat

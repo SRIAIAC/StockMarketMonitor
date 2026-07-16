@@ -86,3 +86,11 @@ def agent_last_ok(name: str) -> bool | None:
     worth OrchestratorAgent retrying, not just an agent that hasn't come
     back around to its own schedule yet."""
     return _last_ok.get(name)
+
+
+def last_run_for(name: str) -> dt.datetime | None:
+    """Raw last-run timestamp, no staleness judgment attached — used by
+    scheduler.py's watchdog to detect *the scheduler itself* going silent
+    (as opposed to agent_liveness()/agent_last_ok(), which judge one
+    agent's own health assuming the scheduler is still ticking)."""
+    return _last_run.get(name)
